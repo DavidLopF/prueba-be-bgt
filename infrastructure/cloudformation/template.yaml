@@ -1,0 +1,352 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  BTG Pactual - Plataforma de Gestión de Fondos
+  Stack completo: VPC · DocumentDB · ECR · App Runner · Secrets Manager
+
+# ============================================================
+# PARÁMETROS
+# ============================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Ambiente de despliegue
+
+  AppName:
+    Type: String
+    Default: btg-pactual-fondos
+    Description: Nombre base de los recursos
+
+  DocDbUsername:
+    Type: String
+    Default: btgadmin
+    NoEcho: false
+    Description: Usuario administrador de DocumentDB
+
+  DocDbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Contraseña de DocumentDB (mínimo 8 caracteres)
+
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: Clave secreta para JWT (mínimo 32 caracteres)
+
+  DocDbInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues: [db.t3.medium, db.r5.large, db.r5.xlarge]
+    Description: Tipo de instancia DocumentDB
+
+  AppRunnerCpu:
+    Type: String
+    Default: "1 vCPU"
+    AllowedValues: ["0.25 vCPU", "0.5 vCPU", "1 vCPU", "2 vCPU", "4 vCPU"]
+
+  AppRunnerMemory:
+    Type: String
+    Default: "2 GB"
+    AllowedValues: ["0.5 GB", "1 GB", "2 GB", "3 GB", "4 GB", "6 GB", "8 GB", "10 GB", "12 GB"]
+
+# ============================================================
+# RECURSOS
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # VPC & NETWORKING
+  # ----------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-vpc"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Subnets privadas para DocumentDB (mínimo 2 AZs requeridas)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-private-subnet-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-private-subnet-2"
+
+  # ----------------------------------------------------------
+  # SECURITY GROUPS
+  # ----------------------------------------------------------
+  DocumentDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Acceso a DocumentDB desde App Runner VPC Connector
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          SourceSecurityGroupId: !Ref AppRunnerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-docdb-sg"
+
+  AppRunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group para App Runner VPC Connector
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-apprunner-sg"
+
+  # ----------------------------------------------------------
+  # SECRETS MANAGER — Credenciales centralizadas
+  # ----------------------------------------------------------
+  AppSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/${Environment}/secrets"
+      Description: Credenciales y configuración sensible de BTG Pactual Fondos
+      SecretString: !Sub |
+        {
+          "MONGODB_URI": "mongodb://${DocDbUsername}:${DocDbPassword}@${DocumentDBCluster.Endpoint}:27017/btgpactual?tls=true&tlsCAFile=/opt/amazon-documentdb/rds-combined-ca-bundle.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false",
+          "JWT_SECRET": "${JwtSecret}",
+          "JWT_EXPIRATION": "86400000",
+          "DOCDB_USERNAME": "${DocDbUsername}",
+          "DOCDB_PASSWORD": "${DocDbPassword}"
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------
+  # AMAZON DOCUMENTDB (MongoDB-compatible)
+  # ----------------------------------------------------------
+  DocumentDBSubnetGroup:
+    Type: AWS::DocDB::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group para DocumentDB BTG
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-docdb-subnet-group"
+
+  DocumentDBCluster:
+    Type: AWS::DocDB::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub "${AppName}-cluster"
+      MasterUsername: !Ref DocDbUsername
+      MasterUserPassword: !Ref DocDbPassword
+      DBSubnetGroupName: !Ref DocumentDBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DocumentDBSecurityGroup
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "02:00-03:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      DeletionProtection: false  # Cambiar a true en producción real
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-docdb-cluster"
+        - Key: Environment
+          Value: !Ref Environment
+
+  DocumentDBInstance:
+    Type: AWS::DocDB::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DocumentDBCluster
+      DBInstanceClass: !Ref DocDbInstanceClass
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-docdb-instance"
+
+  # ----------------------------------------------------------
+  # ECR — Repositorio de imágenes Docker
+  # ----------------------------------------------------------
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AppName}"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Mantener últimas 10 imágenes",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------------------------
+  # IAM — Rol para App Runner
+  # ----------------------------------------------------------
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-apprunner-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: tasks.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref AppSecrets
+
+  AppRunnerAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+  # ----------------------------------------------------------
+  # APP RUNNER — VPC Connector (para acceder a DocumentDB)
+  # ----------------------------------------------------------
+  AppRunnerVpcConnector:
+    Type: AWS::AppRunner::VpcConnector
+    Properties:
+      VpcConnectorName: !Sub "${AppName}-vpc-connector"
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref AppRunnerSecurityGroup
+
+  # ----------------------------------------------------------
+  # APP RUNNER — Servicio principal
+  # ----------------------------------------------------------
+  AppRunnerService:
+    Type: AWS::AppRunner::Service
+    DependsOn:
+      - DocumentDBInstance
+    Properties:
+      ServiceName: !Sub "${AppName}-service"
+      SourceConfiguration:
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt AppRunnerAccessRole.Arn
+        AutoDeploymentsEnabled: true
+        ImageRepository:
+          ImageIdentifier: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest"
+          ImageRepositoryType: ECR
+          ImageConfiguration:
+            Port: "8080"
+            RuntimeEnvironmentSecrets:
+              - Name: MONGODB_URI
+                Value: !Sub "${AppSecrets}:MONGODB_URI::"
+              - Name: JWT_SECRET
+                Value: !Sub "${AppSecrets}:JWT_SECRET::"
+              - Name: JWT_EXPIRATION
+                Value: !Sub "${AppSecrets}:JWT_EXPIRATION::"
+            RuntimeEnvironmentVariables:
+              - Name: SPRING_PROFILES_ACTIVE
+                Value: !Ref Environment
+      InstanceConfiguration:
+        Cpu: !Ref AppRunnerCpu
+        Memory: !Ref AppRunnerMemory
+        InstanceRoleArn: !GetAtt AppRunnerInstanceRole.Arn
+      NetworkConfiguration:
+        EgressConfiguration:
+          EgressType: VPC
+          VpcConnectorArn: !GetAtt AppRunnerVpcConnector.VpcConnectorArn
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /actuator/health
+        Interval: 20
+        Timeout: 5
+        HealthyThreshold: 2
+        UnhealthyThreshold: 3
+      AutoScalingConfigurationArn: !GetAtt AppRunnerAutoScalingConfig.AutoScalingConfigurationArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AppRunnerAutoScalingConfig:
+    Type: AWS::AppRunner::AutoScalingConfiguration
+    Properties:
+      AutoScalingConfigurationName: !Sub "${AppName}-autoscaling"
+      MaxConcurrency: 100
+      MaxSize: 5
+      MinSize: 1
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+Outputs:
+  AppRunnerServiceUrl:
+    Description: URL del servicio App Runner (HTTPS automático)
+    Value: !Sub "https://${AppRunnerService.ServiceUrl}"
+    Export:
+      Name: !Sub "${AWS::StackName}-AppUrl"
+
+  DocumentDBEndpoint:
+    Description: Endpoint del cluster DocumentDB
+    Value: !GetAtt DocumentDBCluster.Endpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-DocDBEndpoint"
+
+  ECRRepositoryUri:
+    Description: URI del repositorio ECR para push de imágenes
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ECRUri"
+
+  SecretsManagerArn:
+    Description: ARN del secret en Secrets Manager
+    Value: !Ref AppSecrets
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretsArn"
