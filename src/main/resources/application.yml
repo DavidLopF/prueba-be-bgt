@@ -1,0 +1,32 @@
+spring:
+  application:
+    name: btg-pactual-fondos
+
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://localhost:27017/btgpactual}
+      database: btgpactual
+
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+server:
+  port: 8080
+
+# JWT
+app:
+  jwt:
+    secret: ${JWT_SECRET:a7bb5c9ec3e8b35f453affe39fe3df48fc25377aa8bdf4be68626deefbfa25b3}
+    expiration-ms: 86400000  # 24 horas
+
+# Swagger / OpenAPI
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    com.enterprise.btgpactual: DEBUG
